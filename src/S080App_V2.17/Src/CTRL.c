@@ -25,23 +25,25 @@ History:
 /******************************************************************************/
 extern vu16 AWD_entry;
 extern u32 Resistance;
-extern u8  frequency_pos;
+extern u8 frequency_pos;
 extern u32 slide_data;
-extern u8  MarkAd_pos;
+extern u8 MarkAd_pos;
 extern u8 gAlarm_type;
 /******************************************************************************/
 DEVICE_INFO_SYS device_info;
 static u8 gCtrl_status = START;//当前模式标志位
-static u8 gPre_status ;
+static u8 gPre_status;
 static u8 gFirst_entry = 0;
 static u16 gHt_flag = 0;//温度状态标志位
-static u8  Adapt_pos;
+static u8 Adapt_pos;
+static u8 over = 0;//过冲标志
 vu8 MMA_INT1;
 vu32 Timer_Counter;
+u32 firstheat;
 
 const DEVICE_INFO_SYS info_def =
 {
-    "1.06",     //Ver
+    "1.07",     //Ver
     STBTEMP_VAL * 10,           //T_Standby;    // 200°C=1800  2520,待机温度
     WKTEMP_VAL * 10,            // T_Work;      // 350°C=3362, 工作温度
     TEMPSTP_VAL * 10,           //T_Step;
@@ -50,7 +52,8 @@ const DEVICE_INFO_SYS info_def =
     USMODE_VAL,                 //handers
     TEMPUNIT_VAL,               //摄氏/华氏
     OFFVOLT_VAL * 10 ,          //保护电压
-    ZEROCALI_VAL                //校准AD值
+    ZEROCALI_VAL,               //校准AD值
+    PORTABLE_VAL                //便携电源
 };
 struct _pid
 {
@@ -77,10 +80,7 @@ unsigned int Timer_ElapseValue(const unsigned int start)
         // 计时器已经回滚
         return 0xffffffff - start + Timer_Counter;
     }
-    else
-    {
-        return Timer_Counter - start;
-    }
+    else        return Timer_Counter - start;
 }
 
 unsigned int Timer_ElapseSecond(const unsigned int start)
@@ -89,12 +89,9 @@ unsigned int Timer_ElapseSecond(const unsigned int start)
     if (Timer_Counter < start)
     {
         // 计时器已经回滚
-        return (0xffffffff - start + Timer_Counter) / 100;
+        return (0xffffffff - start + Timer_Counter) / 1000;
     }
-    else
-    {
-        return (Timer_Counter - start) / 100;
-    }
+    else        return (Timer_Counter - start) / 1000;
 }
 /*******************************************************************************
 函数名: newSqrt
@@ -170,7 +167,6 @@ u16 Get_HtFlag(void)
 {
     return gHt_flag;
 }
-
 /*******************************************************************************
 函数名: System_Init
 函数作用: 系统初始化
@@ -222,7 +218,6 @@ void Vol_Set(u8 pos)
         Delay_Ms(V_TIMER);
         GPIO_ResetBits(GPIOB, GPIO_Pin_3);
         /*--------------------------------------------------*/
-
     }
     else if(pos == 3)//-0.2
     {
@@ -240,12 +235,11 @@ void Vol_Set(u8 pos)
 /*******************************************************************************
 函数名:  Frequency_Set
 函数作用:频率设置
-输入参数:pos 0:8M  1:48M
+输入参数:pos 1:8M  0:48M
 返回参数:NULL
 *******************************************************************************/
-void Frequency_Set (u8 pos)
+void Frequency_Set(u8 pos)
 {
-
     USB_Port(DISABLE);
     return;	//always 48MHz
     /*   //next version support
@@ -264,30 +258,26 @@ void Frequency_Set (u8 pos)
 *******************************************************************************/
 u32 Get_Resistance(void)
 {
-    u8 i, j;
-    static u32 slide_sum = 0;
+    u8 i;
+    u32 slide_sum = 0;
     
-    for(j = 0 ; j < 2; j++)
+    for(i = 0 ; i < 12; i++)//三次的和
     {
-        slide_sum = 0;
-        for(i = 0 ; i < 3; i++)
-        {
-            GPIO_SetBits(GPIOA, GPIO_Pin_0);
-            Delay_Ms(5);
-            MarkAd_pos = 0;
-            Delay_Ms(5);
-            slide_sum = slide_sum + slide_data;
-            GPIO_ResetBits(GPIOA, GPIO_Pin_0);
-            Delay_Ms(5);
-            MarkAd_pos = 1;
-            Delay_Ms(5);
-            slide_sum = slide_sum - slide_data;
-            Clear_Watchdog();
-
-        }
+        GPIO_SetBits(GPIOA, GPIO_Pin_0);
+        Delay_Ms(2);
+        MarkAd_pos = 0;
+        Delay_Ms(1);
+        slide_sum = slide_sum + slide_data;
+        GPIO_ResetBits(GPIOA, GPIO_Pin_0);
+        Delay_Ms(2);
+        MarkAd_pos = 1;
+        Delay_Ms(1);
+        slide_sum = slide_sum - slide_data;
+        Clear_Watchdog();
     }
-    Resistance =  (slide_sum * 550000 / (4096 * 9)) / 22;//旧公式
-    //Resistance = (slide_sum * 2200000) / 810 / 4096;
+    
+    //Resistance = (slide_sum * 533000 / (4096 * 9)) / 22;//旧公式
+    Resistance = (slide_sum * 550000) / 810 / 4096;
     
     if(Resistance / 100 > 10)
         Get_Resistance();
@@ -311,7 +301,7 @@ u32 Vol_Get(void)
     }
     tmp = sum / 10;
     tmp = ((tmp * 330) / 4096) * 137 / 27; //电压vb = 3.3 * 85 *ad * 3/ 40950 * 14扩大100倍
-    //tmp = ((tmp*330/4096)*(2270/27))/10;
+
     return tmp;
 }
 /*******************************************************************************
@@ -329,8 +319,8 @@ void Pid_Init(void)
     pid.integral    = 0;
     pid.ht_time     = 0;
     pid.kp          = 15;
-    pid.ki          = 2;
-    pid.kd          = 1;
+    pid.ki          = 4;
+    pid.kd          = 50;
 }
 /*******************************************************************************
 函数名: Pid_Realize
@@ -340,42 +330,63 @@ void Pid_Init(void)
 *******************************************************************************/
 u16 Pid_Realize(s16 temp)
 {
-    u8 index = 0, index1 = 2;
-    s16 d_err = 0;
+    u8 index = 0;//积分加热
+    u8 index1 = 1;//微分加热
+    s16 d_err = 0;//超过的温度
 
-    pid.actualtemp   = temp;//当前温度
-    pid.err          = pid.settemp - pid.actualtemp;//温差
-    //温差大于50大幅加热
-    if(pid.err >= 500)  index = 0;//500改成300 2018.3.16
+    pid.actualtemp = temp;//当前温度
+    pid.err        = pid.settemp - pid.actualtemp;//目标温差
+
+    if(pid.actualtemp > pid.settemp + 30)       over++;
+    if(over > 10)                               pid.integral = 0;
+    if(pid.actualtemp > pid.settemp + 120)      over = 0;
+    if(pid.actualtemp < pid.settemp)            over = 0;
+    
+    if(pid.err >= 300)  index = 0;//500改成300 2018.3.16
     else
     {
         index = 1;
-        pid.integral    += pid.err;//积分项
+        if(over == 0)
+            pid.integral += pid.err;//积分项
     }
+    
     //降温去积分
     if(pid.settemp < pid.actualtemp)
     {
         d_err = pid.actualtemp - pid.settemp;//超过的温度
-        if(d_err > 30)
+        
+        if(firstheat == 1)
         {
-            pid.integral = 0; //过冲3℃
-            index1 = 0;
+            if(d_err > 30)
+            {
+                pid.integral = 0;
+                index = 0;
+                firstheat = 0;
+            }
+        }
+        if(d_err > 150)//过冲15℃,
+        {
+            pid.integral = 0;
             index = 0;
         }
     }
+    
     //温差小于3°精细加热
-    if(pid.err <= 30) index1 = 0;
-    else index1 = 2;
-    /*---------------------------正常加热-------------------大幅加热-------------------------精细加热---------------------*/
-    pid.ht_time     = (pid.kp * pid.err) + (pid.ki * index * pid.integral) + (pid.kd * (pid.err - pid.err_last) * index1);
-    pid.err_last    = pid.err;
+    if(pid.err <= 30 && pid.err >= -30)                 index1 = 0;
+    else                                                index1 = 1;
+    
+    if(pid.err > 30 && pid.err - pid.err_last < 0)      index1 = 0;//低于目标温度升温时微分不生效
+    if(pid.err < -30 && pid.err - pid.err_last > 0)     index1 = 0;//高于目标温度降温时微分不生效
+    
+    /*--------------------正常加热-------------------积分加热-------------------------微分加热---------------------*/
+    pid.ht_time = (pid.kp * pid.err) + (pid.ki * index * pid.integral) + (pid.kd * (pid.err - pid.err_last) * index1);
+    pid.err_last = pid.err;
 
-    if(pid.ht_time <= 0)          pid.ht_time = 0;
-    else if(pid.ht_time > HEATINGCYCLE * 200) pid.ht_time = HEATINGCYCLE * 200; //30改成10 2018.3.16
-    /*------------------------------防止电压掉到过低------------------------------*/
+    if(pid.ht_time <= 0)                        pid.ht_time = 0;
+    else if(pid.ht_time > HEATINGCYCLE * 20)    pid.ht_time = HEATINGCYCLE * 20; //30改成10 2018.3.16
+
     return pid.ht_time;
 }
-
 /*******************************************************************************
 函数名: Heating_Time
 函数作用: 计算加热标志，返回加热时间
@@ -389,18 +400,18 @@ u32 Heating_Time(s16 temp, s16 wk_temp)
     pid.settemp = wk_temp;
     if(wk_temp > temp)
     {
-        if(wk_temp - temp >= 18)gHt_flag = HEATING;//0;//加热
-        else gHt_flag = KEEPUP;////2;//恒温
+        if(wk_temp - temp >= 18)        gHt_flag = HEATING;//0;//加热
+        else                            gHt_flag = KEEPUP;//2;//恒温
     }
     else
     {
-        if(temp - wk_temp <= 18)gHt_flag = KEEPUP;    ////2     恒温
-        else gHt_flag = COOLING;////1;//降温
+        if(temp - wk_temp <= 18)        gHt_flag = KEEPUP;//2;//恒温
+        else                            gHt_flag = COOLING;//1;//降温
     }
 
-    heat_timecnt = Pid_Realize(temp);//Sub_data * 1000;
+    heat_timecnt = Pid_Realize(temp);//Sub_data * 1000,PID自整定加热时间
 
-    return heat_timecnt;
+    return heat_timecnt;// 0 - 2000
 }
 /*******************************************************************************
 函数名: Volt_Setting
@@ -413,6 +424,7 @@ void Vol_Calculation(u8 pos)
     double Rated_Vol = 0;
     u16 i;
 
+    Vol_Set(1);
     Vol_Set(0);
     Delay_Ms(200);
     if(pos)//根据内阻和功率计算电压
@@ -432,7 +444,7 @@ void Vol_Calculation(u8 pos)
             Adapt_pos = QC2_0;//QC2.0
         }
     }
-
+    
     if(Adapt_pos == QC3_0)
     {
         if(Rated_Vol > Vol_Get() + 20)//升压
@@ -470,9 +482,7 @@ void Vol_Calculation(u8 pos)
         Vol_Set(1);
         Vol_Set(0);
     }
-
 }
-
 /*******************************************************************************
 函数名: Status_Tran
 函数作用: 根据按键、温度判断等控制状态转换
@@ -482,17 +492,23 @@ void Vol_Calculation(u8 pos)
 void Status_Tran(void)//状态转换
 {
     u32 key;
-    static s16 cur_temp_c, dst_temp_c;
+    static s16 cur_temp_c;              //当前温度
+    static s16 dst_temp_c;              //目标温度
     static s16 temp_val;
-    u8 cur_ht_flag = 0;
-    static u8  last_ht_flag = 0;
+    u8 cur_ht_flag = 0;                 //当前加热标志
+    static u8 last_ht_flag = 0;         //前一加热标志
     static u8 disp_switch = 0;
     static u16 bk = 0x33, dl_cnt = 0;
-    static u8 over_off_pos = 0;
-    s16 heat_timecnt = 0;
+    static u8 over_off_pos = 0;         //电压异常计数
+    static u8 increase_vol = 0;         //提升电压计数
+    static u8 alarm = 0;                //警告提示计数
+    static u32 count = 0;               //唤醒模式计数
+    static u8 kaka = 0;                 //唤醒模式计数
+    s16 heat_timecnt = 0;               //加热时间
     char str[16];
     u16 len;
     s32 ad_value = 0, i, h_cnt = 0;
+    
     switch (Get_CtrlStatus()) //获取当前状态
     {
     case IDLE://待机状态
@@ -503,37 +519,75 @@ void Status_Tran(void)//状态转换
             Display_BG();
             Show_Ver(device_info.ver, 0);
             gFirst_entry = 0;
-            G6_TIMER = device_info.wait_time;
+            G6_TIMER = device_info.wait_time * 10;
+            DISP_TIMER = 500;
+            firstheat = 1;
         }
         else if(UI_TIMER == 0 && G6_TIMER != 0)
         {
             Show_Notice();//显示待机图像
-            UI_TIMER = 100;
-        }
-
-        if( gFirst_entry)
-        {
-            // 从其它状态转换dle状态
-            gFirst_entry = 0;
-            G6_TIMER = device_info.wait_time;
-            bk = 33;
+            UI_TIMER = 1000;
         }
         
-        Get_Resistance();
+        if(device_info.portable_flag)//移动电源模式唤醒程序
+        {
+            if(DISP_TIMER == 0 && count < 1200)
+            {
+                if(count == 0)
+                    Vol_Set(1);
+                    Vol_Set(0);
+                Set_HeatingTime(50);
+                DISP_TIMER = 500;//0.5s
+                count++;
+            }
+            if(count == 1200)
+            {
+                Vol_Set(1);
+                count++;
+            }
+        }
+        else//非移动电源模式唤醒程序
+        {
+            if(DISP_TIMER == 0 && kaka < 60)
+            {
+                if(kaka == 0)
+                    Vol_Set(1);
+                    Vol_Set(0);
+                Set_HeatingTime(50);
+                DISP_TIMER = 500;//0.5s
+                kaka++;
+            }
+            if(kaka == 60)
+            {
+                Vol_Set(1);
+                kaka++;
+            }
+        }
+        
+        if(gFirst_entry)//从其它状态转换dle状态
+        {
+            gFirst_entry = 0;
+            G6_TIMER = device_info.wait_time * 10;
+            bk = 0x33;
+            count = 0, kaka = 0;//重置唤醒模式计数
+            firstheat = 1;
+        }
+        
+        Get_Resistance();//获取电阻值
         
         key = Get_gKey();
-        if(key &&  G6_TIMER) // if G6_TIMER==0(屏幕保护状态)第一个按键不起效
+        if(key && G6_TIMER) // if G6_TIMER==0(屏幕保护状态)第一个按键不起效
         {
             switch(key)
             {
             case KEY_V1://单按A键，进入控温状态
-                Get_Resistance();
+                Get_Resistance();//获取电阻值
                 if(Resistance / 100 <= 1 || Resistance / 100 > 10)
                 {
                     Clear_Screen();
-                    //Display_Str8(0, "No ew head!", 0);
-                    Show_NoElectriciron();
-                    Delay_Ms(1000);
+                    Display_Str8(0, "   No Tip!", 0);//提示无电烙铁
+                    //Show_NoElectriciron();//提示无电烙铁
+                    Delay_Ms(1500);
                     Clear_Screen();
                     break;
                 }
@@ -551,15 +605,15 @@ void Status_Tran(void)//状态转换
                         }
                     }                    
                 }
-                Vol_Calculation(1);
-                Frequency_Set(1);//降到8MHz
+                
+                Vol_Calculation(1);//根据判断计算出工作电压并设置
+                Frequency_Set(1);//降到8MHz,但是降不下去
                 Set_CtrlStatus(TEMP_CTR);//设置当前状态为控温状态
                 break;
-            case KEY_V2://单按B键
-                Vol_Calculation(1);
+            case KEY_V2://单按B键，进入设置模式
                 Set_CtrlStatus(TEMP_SET);//进入设置模式
                 break;
-            case KEY_CN|KEY_V1://长按A键
+            case KEY_CN|KEY_V1://长按A键，显示电阻值
                 Clear_LongKey()	;
                 Clear_Screen();
                 own_sprintf(str, "Tip R:%d", Resistance ? Resistance / 100 : 0);
@@ -575,69 +629,119 @@ void Status_Tran(void)//状态转换
                 break;
             }
         }
+        
         if(G6_TIMER == 0 && bk)
         {
             //屏保
             dl_cnt++;
             if(dl_cnt == 50)
             {
-                Scr_Protect(bk--);
+                Scr_Protect(bk--);//屏幕保护  降低屏幕对比度
                 dl_cnt = 0;
             }
-            if(bk == 0) Oled_DisplayOff();
+            if(bk == 0)         Oled_DisplayOff();//关闭OLED显示
         }
-        if(Get_MmaActive() || key)
+        if(Get_MmaActive() || key)//获取加速度传感器静动状态
         {
-            G6_TIMER = device_info.wait_time;
+            G6_TIMER = device_info.wait_time * 10;
             if(bk == 0)
             {
                 bk = 0x33;
                 Scr_Protect(bk);
-                Oled_DisplayOn();
+                Oled_DisplayOn();//打开OLED显示
             }
         }
         break;
     case TEMP_CTR://温控状态，烙铁工作的主要状态
-        if(gFirst_entry)
+        if(gFirst_entry)//初次进入
         {
             gFirst_entry = 0;
             Clear_Screen();
             TEMPSHOW_TIMER = 0;
-            G6_TIMER = device_info.wait_time;
+            G6_TIMER = device_info.wait_time * 10;
+        }
+        
+        if(increase_vol != 0)
+        {
+            Vol_Set(1);
+            Vol_Set(0);
+        }
+        if(Read_Vb() == 0)
+        {
+            over_off_pos = 0;
+            increase_vol = 0;
+        }
+        
+        if(firstheat == 1)
+        {
+            if(Read_Vb() != 0)  //电压异常
+            {
+                over_off_pos++;
+                if(over_off_pos == 200)
+                {
+                    over_off_pos = 0;
+                    Set_CtrlStatus(ALARM);
+                }
+                break;
+            }
+            else        over_off_pos = 0;
+        }
+        else if(LEAVE_WAIT_TIMER == 0)
+        {
+            if(Read_Vb() != 0)  //电压异常
+            {
+                over_off_pos++;
+                if(over_off_pos == 10)
+                {
+                    over_off_pos = 0;
+                    increase_vol++;
+                    LEAVE_WAIT_TIMER = 4000;
+                    if(increase_vol == 3)
+                    {
+                        Set_CtrlStatus(ALARM);
+                        increase_vol = 0;
+                        break;
+                    }
+                }
+            }
         }
         
         key = Get_gKey();
         switch(key)
         {
-        case KEY_CN|KEY_V1://长按A键进入温度设置
-            Clear_LongKey();
-            Set_HeatingTime(0);//加热时间设置为0，停止加热
-            Clear_Screen();
-            Set_CtrlStatus(TEMP_SET);//进入设置模式
-            HEATING_TIMER       = 0;//内部加热
-            break;
-        case KEY_CN|KEY_V2://长按B键返回待机
-            Clear_LongKey();
-            Set_HeatingTime(0);
-            Set_CtrlStatus(IDLE);//返回待机状态
-            Vol_Set(1);
-            break;
+            case KEY_CN|KEY_V1://长按A键进入温度设置
+                Clear_LongKey();
+                Set_HeatingTime(0);//加热时间设置为0，停止加热
+                Clear_Screen();
+                Set_CtrlStatus(TEMP_SET);//进入设置模式
+                HEATING_TIMER = 0;//内部加热
+                break;
+            case KEY_CN|KEY_V2://长按B键返回待机
+                Clear_LongKey();
+                Set_HeatingTime(0);
+                Set_CtrlStatus(IDLE);//返回待机状态
+                Vol_Set(1);
+                break;
         }
         
-        if(device_info.temp_flag == TEMP_UNIT_F)        dst_temp_c = Temp_conversion(1, device_info.t_work); //F&C判断
+        //F&C判断
+        if(device_info.temp_flag == TEMP_UNIT_F)        dst_temp_c = Temp_conversion(1, device_info.t_work); 
         else                                            dst_temp_c = device_info.t_work;
-        if(HEATING_TIMER == 0)  //计时结束
+        
+        //if(HEATING_TIMER == 0)  //计时结束
+        if(Get_HeatingTime() == 0)
         {
             cur_temp_c = Get_Temp();//实际温度(停止加热25ms)
-            heat_timecnt  = Heating_Time(cur_temp_c, dst_temp_c); //计算加热时间
-            Set_HeatingTime(heat_timecnt);
-            HEATING_TIMER = HEATINGCYCLE;//10ms
+            heat_timecnt = Heating_Time(cur_temp_c, dst_temp_c);//计算加热时间
+            Set_HeatingTime(heat_timecnt);//设置加热时间
+            //HEATING_TIMER = HEATINGCYCLE;//100ms
         }
-        if(_abs(cur_temp_c, dst_temp_c) < HYSTERETIC_VAL)   cur_temp_c = dst_temp_c;
-        cur_ht_flag = Get_HtFlag();
-        if(cur_ht_flag != COOLING ||  last_ht_flag != COOLING)
+        if(_abs(cur_temp_c, dst_temp_c) < HYSTERETIC_VAL)       cur_temp_c = dst_temp_c;
+        cur_ht_flag = Get_HtFlag();//获取当前加热标志
+        
+        if(cur_ht_flag != COOLING || last_ht_flag != COOLING)
         {
-            DISP_TIMER = 100;
+            DISP_TIMER = 1000;
         }
         last_ht_flag = cur_ht_flag;
         if(DISP_TIMER == 0 && UI_TIMER == 0)
@@ -657,79 +761,70 @@ void Status_Tran(void)//状态转换
                 Show_TempDown(cur_temp_c / 10, dst_temp_c / 10);
             }
 
-            UI_TIMER = 50;
+            UI_TIMER = 500;
         }
 
-        if(TEMPSHOW_TIMER == 0  && DISP_TIMER) // && (!td_flag))
+        if(TEMPSHOW_TIMER == 0  && DISP_TIMER)//加热画面显示
         {
-            //20ms
             if(disp_switch)
             {
                 disp_switch = 0;
                 Clear_Screen();
             }
             temp_val = cur_temp_c;
-            if(device_info.temp_flag == TEMP_UNIT_F)  temp_val = Temp_conversion(0, temp_val);
+            if(device_info.temp_flag == TEMP_UNIT_F)    temp_val = Temp_conversion(0, temp_val);
+            
             Display_Temp(0, temp_val / 10);
-            Show_HeatingIcon(cur_ht_flag,  Get_MmaActive() );//0升温1降温2恒温
-            TEMPSHOW_TIMER = 20;//200ms
+            Show_HeatingIcon(cur_ht_flag, Get_MmaActive());//0升温1降温2恒温
+            TEMPSHOW_TIMER = 200;//200ms
         }
-        if(Get_MmaActive() || key)
+        
+        if(Get_MmaActive() || key)//获取加速度传感器静动状态
         {
-            G6_TIMER = device_info.wait_time;
+            G6_TIMER = device_info.wait_time * 10;
         }
         if(G6_TIMER == 0)       //进入休眠
         {
             Set_HeatingTime(0);
             Set_CtrlStatus(WAIT);
         }
-        if(Read_Vb() != 0)  //电压异常
-        {
-            over_off_pos++;
-            if(over_off_pos == 200)
-            {
-                over_off_pos = 0;
-                Set_CtrlStatus(ALARM);
-            }
-        }
-        else
-        {
-            over_off_pos = 0;
-        }
-        if(Get_AlarmType() > NORMAL_TEMP)  //警告
+        
+        if(Get_AlarmType() > NORMAL_TEMP && Get_AlarmType() < 4)  //警告
         {
             Set_CtrlStatus(ALARM);
         }
         break;
     case WAIT://休眠状态
-        if( gFirst_entry)
+        if(gFirst_entry)
         {
             // 从其它状态转换 到wait状态
             gFirst_entry = 0;
             TEMPSHOW_TIMER = 0;
-            G6_TIMER = device_info.wait_time;
+            G6_TIMER = device_info.wait_time * 10;
+            firstheat = 1;
         }
+        
         if(device_info.temp_flag == TEMP_UNIT_F)    	dst_temp_c = Temp_conversion(1, device_info.t_standby);
         else                        			dst_temp_c = device_info.t_standby;
-        if(device_info.t_standby > device_info.t_work)
+        if(device_info.t_standby > device_info.t_work)//休眠温度比工作温度高
         {
-            //休眠温度比工作温度高
-            if(device_info.temp_flag == TEMP_UNIT_F)    	dst_temp_c = Temp_conversion(1, device_info.t_work);
-            else                        			dst_temp_c = device_info.t_work;//不再升温保持低的一项温度
+            if(device_info.temp_flag == TEMP_UNIT_F)    dst_temp_c = Temp_conversion(1, device_info.t_work);
+            else                        	        dst_temp_c = device_info.t_work;//不再升温保持低的一项温度
         }
+        
         if(HEATING_TIMER == 0)
         {
             cur_temp_c = Get_Temp();
-            heat_timecnt  = Heating_Time(cur_temp_c, dst_temp_c);  //计算加热时间
-            Set_HeatingTime(heat_timecnt);
-            HEATING_TIMER = 30;
+            heat_timecnt = Heating_Time(cur_temp_c, dst_temp_c);  //计算加热时间
+            Set_HeatingTime(heat_timecnt);//设置加热时间
+            HEATING_TIMER = 300;
         }
-        if(_abs(cur_temp_c, dst_temp_c) < HYSTERETIC_VAL)   cur_temp_c = dst_temp_c;
+        if(_abs(cur_temp_c, dst_temp_c) < HYSTERETIC_VAL)       cur_temp_c = dst_temp_c;
 
-        cur_ht_flag = Get_HtFlag();
-        if(cur_ht_flag != COOLING ||  last_ht_flag != COOLING)
+        cur_ht_flag = Get_HtFlag();//获取当前加热标志
+        if(cur_ht_flag != COOLING || last_ht_flag != COOLING)
         {
-            DISP_TIMER = 100;
+            DISP_TIMER = 1000;
         }
         last_ht_flag = cur_ht_flag;
         if(DISP_TIMER == 0 && UI_TIMER == 0)
@@ -747,11 +842,11 @@ void Status_Tran(void)//状态转换
             {
                 Show_TempDown(cur_temp_c / 10, dst_temp_c / 10);
             }
-            UI_TIMER = 50;
+            UI_TIMER = 500;
         }
 
         temp_val = cur_temp_c;
-        if(TEMPSHOW_TIMER == 0  && DISP_TIMER)
+        if(TEMPSHOW_TIMER == 0  && DISP_TIMER)////休眠画面显示
         {
             if(disp_switch)
             {
@@ -762,9 +857,10 @@ void Status_Tran(void)//状态转换
             {
                 temp_val = Temp_conversion(0, temp_val);
             }
+            
             Display_Temp(0, temp_val / 10);
             Show_HeatingIcon(cur_ht_flag, Get_MmaActive());//0升温1降温2恒温
-            TEMPSHOW_TIMER = 20;//200ms
+            TEMPSHOW_TIMER = 200;//200ms
         }
 
         if(Get_AlarmType() > NORMAL_TEMP)  //警告
@@ -772,8 +868,10 @@ void Status_Tran(void)//状态转换
             Set_CtrlStatus(ALARM);
             break;
         }
+        
         if(Get_MmaActive() || Get_gKey())
         {
+            //加速度感应器感应
             Set_CtrlStatus(TEMP_CTR);
             break;
         }
@@ -791,33 +889,31 @@ void Status_Tran(void)//状态转换
             Disk_BuffInit();//磁盘数据初始化
             Config_Save();//保存设置到config.txt
             ADC_ITConfig(ADC2, ADC_IT_AWD, ENABLE);
-            Vol_Set(1);//降回5V
             Set_CtrlStatus(IDLE);//返回待机状态
+            Vol_Set(1);//降回5V
         }
         else if(gPre_status == TEMP_CTR)//从温控模式进来
         {
             TempSet_Proc();//只改变 临时温度
             Set_CtrlStatus(TEMP_CTR);//返回温控状态
+            firstheat = 1;
         }
         break;
     case ALARM://警告模式
-        if( gFirst_entry)
+        if(gFirst_entry)
         {
             // 从其它状态转换dle状态
             gFirst_entry = 0;
             Clear_Screen();
-            UI_TIMER = 50;
+            UI_TIMER = 500;
+            firstheat = 1;
         }
         if(Get_HeatingTime != 0)
         {
             Set_HeatingTime(0);//马上停止加热
             HEAT_OFF();
         }
-        if(UI_TIMER == 0)
-        {
-            Show_Warning();//显示错误图片
-            UI_TIMER = 50;
-        }
+        
         switch(Get_AlarmType())
         {
         case HIGH_TEMP:
@@ -827,20 +923,36 @@ void Status_Tran(void)//状态转换
             Get_Temp();
             break;
         case HIGH_VOLTAGE:
-            if(Read_Vb() == 0)
+            if(Read_Vb() == 0)//电压正常
             {
                 Set_CtrlStatus(TEMP_CTR);
             }
             break;
         case LOW_VOLTAGE:
-            if(Vol_Get() > 650)
+            for(i = 0; i < 1; i++)
             {
-                Set_CtrlStatus(TEMP_CTR);
+                Vol_Calculation(1);//根据判断计算出工作电压并设置
+                if(Vol_Get() > 650)//缓冲再恢复加热模式
+                {
+                    Set_CtrlStatus(TEMP_CTR);
+                }
             }
             break;
         case NORMAL_TEMP:
             Set_CtrlStatus(TEMP_CTR);
             break;
+        }
+        
+        if(UI_TIMER == 0)
+        {
+            Show_Warning();//显示错误图片
+            UI_TIMER = 500;
+            alarm++;
+            if(alarm == 3)
+            {
+                alarm = 0;
+                Set_CtrlStatus(IDLE);
+            }
         }
         break;
     default:
